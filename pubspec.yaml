@@ -32,8 +32,8 @@ dependencies:
     sdk: flutter
   cupertino_icons: ^1.0.8
   pdfrx: ^2.0.0
+  sqflite: ^2.4.1
   shared_preferences: ^2.3.3
-  permission_handler: ^11.3.1
   file_picker: ^13.3.3
   wakelock_plus: ^1.2.8
   path: ^1.9.0

@@ -1,10 +1,8 @@
 import 'package:flutter/material.dart';
-import 'package:pdfrx/pdfrx.dart';
 import 'screens/library_screen.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  pdfrxFlutterInitialize();
   runApp(const LuminaReaderApp());
 }
 
@@ -18,14 +16,18 @@ class LuminaReaderApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       themeMode: ThemeMode.system,
       theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF1E3A8A),
+          brightness: Brightness.light,
+        ),
         useMaterial3: true,
-        colorSchemeSeed: Colors.indigo,
-        brightness: Brightness.light,
       ),
       darkTheme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF60A5FA),
+          brightness: Brightness.dark,
+        ),
         useMaterial3: true,
-        colorSchemeSeed: Colors.indigo,
-        brightness: Brightness.dark,
       ),
       home: const LibraryScreen(),
     );

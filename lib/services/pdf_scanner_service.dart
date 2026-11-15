@@ -11,7 +11,6 @@ class PdfScannerService {
   final StorageService _storageService = StorageService();
 
   /// Opens Android's native file manager directly (Downloads, Documents, SD card, etc.)
-  /// Supports selecting one or multiple PDFs at once without duplicating files.
   Future<List<BookModel>> pickPdfsFromFileManager() async {
     final pickedFiles = await FilePicker.pickFiles(
       type: FileType.custom,
@@ -53,15 +52,15 @@ class PdfScannerService {
     return returnedBooks;
   }
 
-  /// Renders Page 1 as a tiny cached PNG thumbnail (~15-25 KB) for the bookshelf.
+  /// Renders Page 1 into persistent App Support storage so Clear Cache keeps covers intact.
   Future<String?> generateCoverThumbnail(BookModel book) async {
     if (book.thumbnailPath != null && await File(book.thumbnailPath!).exists()) {
       return book.thumbnailPath;
     }
 
     try {
-      final cacheDir = await getTemporaryDirectory();
-      final coversDir = Directory(p.join(cacheDir.path, 'book_covers'));
+      final supportDir = await getApplicationSupportDirectory();
+      final coversDir = Directory(p.join(supportDir.path, 'book_covers'));
       if (!await coversDir.exists()) {
         await coversDir.create(recursive: true);
       }
@@ -72,7 +71,7 @@ class PdfScannerService {
 
       if (await outFile.exists()) {
         book.thumbnailPath = outPath;
-        await _storageService.saveBookProgress(book);
+        await _storageService.saveBookProgress(book, immediate: true);
         return outPath;
       }
 
@@ -101,15 +100,13 @@ class PdfScannerService {
           await outFile.writeAsBytes(byteData.buffer.asUint8List());
           book.thumbnailPath = outPath;
           book.totalPages = doc.pages.length;
-          await _storageService.saveBookProgress(book);
+          await _storageService.saveBookProgress(book, immediate: true);
           return outPath;
         }
       } finally {
         await doc.dispose();
       }
-    } catch (_) {
-      // Fallback to default book icon if PDF is password-protected or malformed
-    }
+    } catch (_) {}
     return null;
   }
 }

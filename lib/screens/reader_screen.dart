@@ -70,6 +70,10 @@ class _ReaderScreenState extends State<ReaderScreen> {
     final prefs = await SharedPreferences.getInstance();
     if (!mounted) return;
     final themeIndex = prefs.getInt(_kTheme) ?? 0;
+    final keepAwake = prefs.getBool('reader_wakelock') ?? true;
+    if (keepAwake) {
+      WakelockPlus.enable();
+    }
     setState(() {
       _themeMode = _ReaderThemeMode
           .values[themeIndex.clamp(0, _ReaderThemeMode.values.length - 1)];
