@@ -10,7 +10,9 @@ import 'storage_service.dart';
 class PdfScannerService {
   final StorageService _storageService = StorageService();
 
-  /// Opens Android's native file manager directly (Downloads, Documents, SD card, etc.)
+  /// Opens Android's native file manager directly.
+  /// If Android returns a temporary /cache/file_picker/ copy, moves it into
+  /// persistent App Support storage so "Clear Cache" never deletes the book.
   Future<List<BookModel>> pickPdfsFromFileManager() async {
     final pickedFiles = await FilePicker.pickFiles(
       type: FileType.custom,
@@ -22,23 +24,41 @@ class PdfScannerService {
     final savedMap = await _storageService.getLibraryMap();
     final newlyAdded = <BookModel>[];
     final returnedBooks = <BookModel>[];
+    final supportDir = await getApplicationSupportDirectory();
 
     for (final picked in pickedFiles) {
-      final path = picked.path;
-      if (path == null) continue;
+      final rawPath = picked.path;
+      if (rawPath == null) continue;
 
-      final file = File(path);
-      if (!await file.exists()) continue;
+      final sourceFile = File(rawPath);
+      if (!await sourceFile.exists()) continue;
 
-      if (savedMap.containsKey(path)) {
-        returnedBooks.add(savedMap[path]!);
+      String finalPath = rawPath;
+
+      // Protect against Android's "Clear Cache" wiping /cache/file_picker/ files
+      if (rawPath.contains('/cache/')) {
+        final persistentDir = Directory(p.join(supportDir.path, 'library_pdfs'));
+        if (!await persistentDir.exists()) {
+          await persistentDir.create(recursive: true);
+        }
+        final destPath = p.join(persistentDir.path, p.basename(rawPath));
+        final destFile = File(destPath);
+        if (!await destFile.exists()) {
+          await sourceFile.copy(destPath);
+        }
+        await sourceFile.delete(); // Remove temp cache copy immediately
+        finalPath = destPath;
+      }
+
+      if (savedMap.containsKey(finalPath)) {
+        returnedBooks.add(savedMap[finalPath]!);
         continue;
       }
 
-      final stat = await file.stat();
+      final stat = await File(finalPath).stat();
       final book = BookModel(
-        filePath: path,
-        title: p.basenameWithoutExtension(path),
+        filePath: finalPath,
+        title: p.basenameWithoutExtension(finalPath),
         fileSizeBytes: stat.size,
       );
       newlyAdded.add(book);
