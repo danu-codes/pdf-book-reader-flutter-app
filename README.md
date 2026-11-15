@@ -76,7 +76,7 @@ pdf_book_reader/
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/<your-username>/pdf_book_reader.git
+   git clone https://github.com/danu-codes/pdf-book-reader-flutter-app.git
    cd pdf_book_reader
    ```
 
