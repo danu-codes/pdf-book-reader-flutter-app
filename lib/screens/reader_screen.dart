@@ -6,6 +6,8 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 import '../models/book_model.dart';
 import '../services/storage_service.dart';
 
+enum _ReaderThemeMode { day, sepia, night }
+
 class ReaderScreen extends StatefulWidget {
   final BookModel book;
   const ReaderScreen({super.key, required this.book});
@@ -15,35 +17,35 @@ class ReaderScreen extends StatefulWidget {
 }
 
 class _ReaderScreenState extends State<ReaderScreen> {
-  static const _kNight = 'reader_night_mode';
+  static const _kTheme = 'reader_theme_mode';
   static const _kHorizontal = 'reader_horizontal';
 
+  final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
   final PdfViewerController _pdfController = PdfViewerController();
+  late final PdfTextSearcher _textSearcher;
+  final TextEditingController _searchController = TextEditingController();
   final StorageService _storage = StorageService();
 
   late int _currentPage;
   int _totalPages = 0;
   bool _settingsLoaded = false;
-  bool _isNightMode = false;
+  _ReaderThemeMode _themeMode = _ReaderThemeMode.day;
   bool _horizontal = false;
   bool _showControls = true;
+  bool _isSearching = false;
   double? _dragValue;
 
+  List<PdfOutlineNode> _outline = [];
   Offset? _downPos;
   int _downTime = 0;
-
-  static const ColorFilter _invertFilter = ColorFilter.matrix(<double>[
-    -1, 0, 0, 0, 255,
-    0, -1, 0, 0, 255,
-    0, 0, -1, 0, 255,
-    0, 0, 0, 1, 0,
-  ]);
 
   @override
   void initState() {
     super.initState();
     _currentPage = widget.book.lastPage > 0 ? widget.book.lastPage : 1;
     _totalPages = widget.book.totalPages;
+    _textSearcher = PdfTextSearcher(_pdfController)..addListener(_onSearchUpdate);
+
     WakelockPlus.enable();
     widget.book.lastOpened = DateTime.now();
     _storage.saveBookProgress(widget.book);
@@ -52,24 +54,42 @@ class _ReaderScreenState extends State<ReaderScreen> {
 
   @override
   void dispose() {
+    _textSearcher.removeListener(_onSearchUpdate);
+    _textSearcher.dispose();
+    _searchController.dispose();
     WakelockPlus.disable();
     _storage.flushNow();
     super.dispose();
   }
 
+  void _onSearchUpdate() {
+    if (mounted) setState(() {});
+  }
+
   Future<void> _loadSettings() async {
     final prefs = await SharedPreferences.getInstance();
     if (!mounted) return;
+    final themeIndex = prefs.getInt(_kTheme) ?? 0;
     setState(() {
-      _isNightMode = prefs.getBool(_kNight) ?? false;
+      _themeMode = _ReaderThemeMode
+          .values[themeIndex.clamp(0, _ReaderThemeMode.values.length - 1)];
       _horizontal = prefs.getBool(_kHorizontal) ?? false;
       _settingsLoaded = true;
     });
   }
 
-  Future<void> _saveSetting(String key, bool value) async {
+  Future<void> _cycleThemeMode() async {
+    final nextIndex = (_themeMode.index + 1) % _ReaderThemeMode.values.length;
+    final nextMode = _ReaderThemeMode.values[nextIndex];
+    setState(() => _themeMode = nextMode);
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(key, value);
+    await prefs.setInt(_kTheme, nextMode.index);
+  }
+
+  Future<void> _toggleDirection() async {
+    setState(() => _horizontal = !_horizontal);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_kHorizontal, _horizontal);
   }
 
   void _onPageChanged(int? page) {
@@ -77,6 +97,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
     setState(() => _currentPage = page);
     widget.book.lastPage = page;
     widget.book.lastOpened = DateTime.now();
+    if (_totalPages > 0 && page >= _totalPages) {
+      widget.book.isManuallyFinished = true;
+    }
     _storage.saveBookProgress(widget.book);
   }
 
@@ -98,7 +121,6 @@ class _ReaderScreenState extends State<ReaderScreen> {
     _pdfController.goToPage(pageNumber: page);
   }
 
-  // Horizontal page layout (pages side by side)
   PdfPageLayout _horizontalLayout(
       List<PdfPage> pages, PdfViewerParams params) {
     final height =
@@ -126,7 +148,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
         ),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
           FilledButton(
             onPressed: () {
               final target = int.tryParse(controller.text);
@@ -151,8 +175,10 @@ class _ReaderScreenState extends State<ReaderScreen> {
           children: [
             const Padding(
               padding: EdgeInsets.all(16),
-              child: Text('Saved Bookmarks',
-                  style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
+              child: Text(
+                'Saved Bookmarks',
+                style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
+              ),
             ),
             if (widget.book.bookmarks.isEmpty)
               const Padding(
@@ -192,29 +218,43 @@ class _ReaderScreenState extends State<ReaderScreen> {
   }
 
   Widget _buildViewer() {
-    Widget viewer = PdfViewer.file(
-      widget.book.filePath,
-      key: ValueKey(_horizontal), // rebuild on direction change, resumes at _currentPage
-      controller: _pdfController,
-      params: PdfViewerParams(
-        layoutPages: _horizontal ? _horizontalLayout : null,
-        calculateInitialPageNumber: (document, controller) =>
-            _currentPage.clamp(1, document.pages.length),
-        onViewerReady: (document, controller) {
-          final total = document.pages.length;
-          widget.book.totalPages = total;
-          _storage.saveBookProgress(widget.book);
-          if (mounted) setState(() => _totalPages = total);
-        },
-        onPageChanged: _onPageChanged,
+    final bgColor = switch (_themeMode) {
+      _ReaderThemeMode.day => const Color(0xFFF2F2F7),
+      _ReaderThemeMode.sepia => const Color(0xFFE8DEC8),
+      _ReaderThemeMode.night => const Color(0xFF121212),
+    };
+
+    final viewer = Container(
+      color: bgColor,
+      child: PdfViewer.file(
+        widget.book.filePath,
+        key: ValueKey(_horizontal),
+        controller: _pdfController,
+        params: PdfViewerParams(
+          backgroundColor: bgColor,
+          layoutPages: _horizontal ? _horizontalLayout : null,
+          calculateInitialPageNumber: (document, controller) =>
+              _currentPage.clamp(1, document.pages.length),
+          onViewerReady: (document, controller) async {
+            final total = document.pages.length;
+            widget.book.totalPages = total;
+            _storage.saveBookProgress(widget.book);
+            final outline = await document.loadOutline();
+            if (mounted) {
+              setState(() {
+                _totalPages = total;
+                _outline = outline;
+              });
+            }
+          },
+          onPageChanged: _onPageChanged,
+          pagePaintCallbacks: [
+            _textSearcher.pageTextMatchPaintCallback,
+          ],
+        ),
       ),
     );
 
-    if (_isNightMode) {
-      viewer = ColorFiltered(colorFilter: _invertFilter, child: viewer);
-    }
-
-    // Listener does not enter the gesture arena, so PDF links/zoom/scroll still work.
     return Listener(
       onPointerDown: (e) {
         _downPos = e.position;
@@ -229,7 +269,143 @@ class _ReaderScreenState extends State<ReaderScreen> {
         }
         _downPos = null;
       },
-      child: viewer,
+      child: Stack(
+        children: [
+          Positioned.fill(child: viewer),
+          if (_themeMode != _ReaderThemeMode.day)
+            Positioned.fill(
+              child: IgnorePointer(
+                child: Container(
+                  color: _themeMode == _ReaderThemeMode.sepia
+                      ? const Color(0x28D4A359)
+                      : const Color(0x55000000),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildOutlineDrawer() {
+    return Drawer(
+      child: SafeArea(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+              child: Text(
+                'Table of Contents',
+                style: Theme.of(context)
+                    .textTheme
+                    .titleMedium
+                    ?.copyWith(fontWeight: FontWeight.bold),
+              ),
+            ),
+            const Divider(),
+            Expanded(
+              child: _outline.isEmpty
+                  ? const Center(
+                child: Padding(
+                  padding: EdgeInsets.all(24),
+                  child: Text(
+                    'This PDF does not include embedded chapters.',
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+              )
+                  : ListView(
+                children: _buildOutlineTiles(_outline, 0),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  List<Widget> _buildOutlineTiles(List<PdfOutlineNode> nodes, int depth) {
+    final tiles = <Widget>[];
+    for (final node in nodes) {
+      final destPage = node.dest?.pageNumber;
+      tiles.add(
+        ListTile(
+          contentPadding: EdgeInsets.only(left: 16.0 + depth * 16.0, right: 16),
+          title: Text(
+            node.title,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontSize: depth == 0 ? 14 : 13,
+              fontWeight: depth == 0 ? FontWeight.w600 : FontWeight.normal,
+            ),
+          ),
+          trailing: destPage != null
+              ? Text(
+            'p.$destPage',
+            style: TextStyle(
+              fontSize: 12,
+              color: Theme.of(context).colorScheme.primary,
+            ),
+          )
+              : null,
+          onTap: destPage != null
+              ? () {
+            Navigator.pop(context);
+            _goTo(destPage);
+          }
+              : null,
+        ),
+      );
+      if (node.children.isNotEmpty) {
+        tiles.addAll(_buildOutlineTiles(node.children, depth + 1));
+      }
+    }
+    return tiles;
+  }
+
+  Widget _buildSearchBar(ColorScheme cs) {
+    final matches = _textSearcher.matches;
+    final currentIdx = _textSearcher.currentIndex;
+
+    return Row(
+      children: [
+        IconButton(
+          icon: const Icon(Icons.arrow_back_rounded),
+          onPressed: () {
+            _textSearcher.resetTextSearch();
+            _searchController.clear();
+            setState(() => _isSearching = false);
+          },
+        ),
+        Expanded(
+          child: TextField(
+            controller: _searchController,
+            autofocus: true,
+            decoration: const InputDecoration(
+              hintText: 'Search text in book...',
+              border: InputBorder.none,
+            ),
+            onChanged: (query) => _textSearcher.startTextSearch(query),
+          ),
+        ),
+        if (matches.isNotEmpty)
+          Text(
+            '${(currentIdx ?? 0) + 1}/${matches.length}',
+            style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+          ),
+        IconButton(
+          icon: const Icon(Icons.keyboard_arrow_up_rounded),
+          onPressed:
+          matches.isEmpty ? null : () => _textSearcher.goToPrevMatch(),
+        ),
+        IconButton(
+          icon: const Icon(Icons.keyboard_arrow_down_rounded),
+          onPressed:
+          matches.isEmpty ? null : () => _textSearcher.goToNextMatch(),
+        ),
+      ],
     );
   }
 
@@ -238,14 +414,20 @@ class _ReaderScreenState extends State<ReaderScreen> {
     final cs = Theme.of(context).colorScheme;
     final isBookmarked = widget.book.bookmarks.contains(_currentPage);
 
+    final (themeIcon, themeLabel) = switch (_themeMode) {
+      _ReaderThemeMode.day => (Icons.wb_sunny_outlined, 'Day Mode'),
+      _ReaderThemeMode.sepia => (Icons.auto_awesome_outlined, 'Warm Sepia'),
+      _ReaderThemeMode.night => (Icons.dark_mode_rounded, 'Dim Night Mode'),
+    };
+
     return Scaffold(
+      key: _scaffoldKey,
+      endDrawer: _buildOutlineDrawer(),
       body: !_settingsLoaded
           ? const Center(child: CircularProgressIndicator())
           : Stack(
         children: [
           Positioned.fill(child: _buildViewer()),
-
-          // Top bar (overlay, does not resize the viewer)
           Positioned(
             top: 0,
             left: 0,
@@ -262,7 +444,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
                     bottom: false,
                     child: SizedBox(
                       height: kToolbarHeight,
-                      child: Row(
+                      child: _isSearching
+                          ? _buildSearchBar(cs)
+                          : Row(
                         children: [
                           const BackButton(),
                           Expanded(
@@ -270,29 +454,28 @@ class _ReaderScreenState extends State<ReaderScreen> {
                               widget.book.title,
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(fontSize: 16),
+                              style: const TextStyle(fontSize: 15),
                             ),
                           ),
                           IconButton(
-                            tooltip: 'Scroll direction',
+                            tooltip: 'Search in Book',
+                            icon: const Icon(Icons.search_rounded),
+                            onPressed: () =>
+                                setState(() => _isSearching = true),
+                          ),
+                          IconButton(
+                            tooltip: themeLabel,
+                            icon: Icon(themeIcon),
+                            onPressed: _cycleThemeMode,
+                          ),
+                          IconButton(
+                            tooltip: _horizontal
+                                ? 'Switch to Vertical Scroll'
+                                : 'Switch to Horizontal Pages',
                             icon: Icon(_horizontal
                                 ? Icons.swap_vert_rounded
                                 : Icons.swap_horiz_rounded),
-                            onPressed: () {
-                              setState(() => _horizontal = !_horizontal);
-                              _saveSetting(_kHorizontal, _horizontal);
-                            },
-                          ),
-                          IconButton(
-                            tooltip: 'Night Reading Mode',
-                            icon: Icon(_isNightMode
-                                ? Icons.light_mode_rounded
-                                : Icons.dark_mode_rounded),
-                            onPressed: () {
-                              setState(
-                                      () => _isNightMode = !_isNightMode);
-                              _saveSetting(_kNight, _isNightMode);
-                            },
+                            onPressed: _toggleDirection,
                           ),
                           IconButton(
                             tooltip: 'Bookmark Page',
@@ -301,10 +484,34 @@ class _ReaderScreenState extends State<ReaderScreen> {
                                 : Icons.bookmark_border_rounded),
                             onPressed: _toggleBookmark,
                           ),
-                          IconButton(
-                            tooltip: 'View Bookmarks',
-                            icon: const Icon(Icons.bookmarks_outlined),
-                            onPressed: _showBookmarksSheet,
+                          PopupMenuButton<String>(
+                            onSelected: (value) {
+                              if (value == 'toc') {
+                                _scaffoldKey.currentState
+                                    ?.openEndDrawer();
+                              } else if (value == 'bookmarks') {
+                                _showBookmarksSheet();
+                              }
+                            },
+                            itemBuilder: (_) => const [
+                              PopupMenuItem(
+                                value: 'toc',
+                                child: ListTile(
+                                  leading: Icon(Icons.toc_rounded),
+                                  title: Text('Chapters'),
+                                  contentPadding: EdgeInsets.zero,
+                                ),
+                              ),
+                              PopupMenuItem(
+                                value: 'bookmarks',
+                                child: ListTile(
+                                  leading: Icon(
+                                      Icons.bookmarks_outlined),
+                                  title: Text('Saved Bookmarks'),
+                                  contentPadding: EdgeInsets.zero,
+                                ),
+                              ),
+                            ],
                           ),
                         ],
                       ),
@@ -314,8 +521,6 @@ class _ReaderScreenState extends State<ReaderScreen> {
               ),
             ),
           ),
-
-          // Bottom bar
           if (_totalPages > 0)
             Positioned(
               bottom: 0,
@@ -349,6 +554,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
                                   'Page $_currentPage / $_totalPages',
                                   style: TextStyle(
                                     fontWeight: FontWeight.bold,
+                                    fontSize: 13,
                                     color: cs.onPrimaryContainer,
                                   ),
                                 ),
@@ -367,6 +573,14 @@ class _ReaderScreenState extends State<ReaderScreen> {
                                   setState(() => _dragValue = null);
                                   _goTo(v.round());
                                 },
+                              ),
+                            ),
+                            Text(
+                              '${((_currentPage / _totalPages) * 100).toStringAsFixed(0)}%',
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                                color: cs.onSurfaceVariant,
                               ),
                             ),
                           ],

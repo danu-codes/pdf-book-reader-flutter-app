@@ -1,140 +1,115 @@
 import 'dart:io';
+import 'dart:ui' as ui;
 import 'package:file_picker/file_picker.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
-import 'package:permission_handler/permission_handler.dart';
+import 'package:pdfrx/pdfrx.dart';
 import '../models/book_model.dart';
 import 'storage_service.dart';
 
 class PdfScannerService {
   final StorageService _storageService = StorageService();
 
-  Future<bool> requestStoragePermission() async {
-    if (!Platform.isAndroid) return true;
-
-    if (await Permission.manageExternalStorage.isGranted) return true;
-    final manage = await Permission.manageExternalStorage.request();
-    if (manage.isGranted) return true;
-
-    final storage = await Permission.storage.request();
-    return storage.isGranted;
-  }
-
-  /// Books already saved (imported / previously read) that still exist.
-  Future<List<BookModel>> loadSavedBooks() async {
-    final savedMap = await _storageService.getSavedBooksMap();
-    final books = <BookModel>[];
-    for (final entry in savedMap.entries) {
-      if (await File(entry.key).exists()) books.add(entry.value);
-    }
-    _sort(books);
-    return books;
-  }
-
-  Future<List<BookModel>> scanDevicePdfs() async {
-    final savedMap = await _storageService.getSavedBooksMap();
-    final results = <BookModel>[];
-    final seen = <String>{};
-
-    for (final entry in savedMap.entries) {
-      if (await File(entry.key).exists()) {
-        results.add(entry.value);
-        seen.add(entry.key);
-      }
-    }
-
-    final root = Directory('/storage/emulated/0');
-    if (await root.exists()) {
-      await _scanDirectory(root, savedMap, results, seen);
-    }
-
-    _sort(results);
-    return results;
-  }
-
-  void _sort(List<BookModel> books) {
-    books.sort((a, b) {
-      if (a.lastOpened != null && b.lastOpened != null) {
-        return b.lastOpened!.compareTo(a.lastOpened!);
-      }
-      if (a.lastOpened != null) return -1;
-      if (b.lastOpened != null) return 1;
-      return a.title.toLowerCase().compareTo(b.title.toLowerCase());
-    });
-  }
-
-  Future<void> _scanDirectory(
-      Directory dir,
-      Map<String, BookModel> savedMap,
-      List<BookModel> results,
-      Set<String> seen,
-      ) async {
-    try {
-      await for (final entity in dir.list(followLinks: false)) {
-        final path = entity.path;
-        final name = p.basename(path);
-        if (name.startsWith('.') ||
-            path.contains('/Android/data') ||
-            path.contains('/Android/obb')) {
-          continue;
-        }
-
-        if (entity is Directory) {
-          await _scanDirectory(entity, savedMap, results, seen);
-        } else if (entity is File && path.toLowerCase().endsWith('.pdf')) {
-          if (seen.add(path)) {
-            final stat = await entity.stat();
-            results.add(savedMap[path] ??
-                BookModel(
-                  filePath: path,
-                  title: p.basenameWithoutExtension(path),
-                  fileSizeBytes: stat.size,
-                ));
-          }
-        }
-      }
-    } catch (_) {
-      // Skip folders with restricted access
-    }
-  }
-
-  /// Picks a PDF and copies it into permanent app storage so that
-  /// progress survives file_picker's cache being cleared.
-  Future<BookModel?> pickSinglePdf() async {
-    final pickedFile = await FilePicker.pickFile(
+  /// Opens Android's native file manager directly (Downloads, Documents, SD card, etc.)
+  /// Supports selecting one or multiple PDFs at once without duplicating files.
+  Future<List<BookModel>> pickPdfsFromFileManager() async {
+    final pickedFiles = await FilePicker.pickFiles(
       type: FileType.custom,
       allowedExtensions: ['pdf'],
     );
-    if (pickedFile == null || pickedFile.path == null) return null;
 
-    final src = pickedFile.path!;
-    final docs = await getApplicationDocumentsDirectory();
-    final booksDir = Directory(p.join(docs.path, 'imported_books'));
-    if (!await booksDir.exists()) await booksDir.create(recursive: true);
+    if (pickedFiles.isEmpty) return [];
 
-    final srcFile = File(src);
-    final srcLen = await srcFile.length();
-    var dest = p.join(booksDir.path, p.basename(src));
-    final destFile = File(dest);
-    if (await destFile.exists()) {
-      if (await destFile.length() != srcLen) {
-        dest = p.join(booksDir.path,
-            '${DateTime.now().millisecondsSinceEpoch}_${p.basename(src)}');
-        await srcFile.copy(dest);
+    final savedMap = await _storageService.getLibraryMap();
+    final newlyAdded = <BookModel>[];
+    final returnedBooks = <BookModel>[];
+
+    for (final picked in pickedFiles) {
+      final path = picked.path;
+      if (path == null) continue;
+
+      final file = File(path);
+      if (!await file.exists()) continue;
+
+      if (savedMap.containsKey(path)) {
+        returnedBooks.add(savedMap[path]!);
+        continue;
       }
-    } else {
-      await srcFile.copy(dest);
+
+      final stat = await file.stat();
+      final book = BookModel(
+        filePath: path,
+        title: p.basenameWithoutExtension(path),
+        fileSizeBytes: stat.size,
+      );
+      newlyAdded.add(book);
+      returnedBooks.add(book);
     }
 
-    final savedMap = await _storageService.getSavedBooksMap();
-    if (savedMap.containsKey(dest)) return savedMap[dest];
+    if (newlyAdded.isNotEmpty) {
+      await _storageService.addBooksToLibrary(newlyAdded);
+    }
 
-    final book = BookModel(
-      filePath: dest,
-      title: p.basenameWithoutExtension(src),
-      fileSizeBytes: srcLen,
-    );
-    await _storageService.saveBookProgress(book);
-    return book;
+    return returnedBooks;
+  }
+
+  /// Renders Page 1 as a tiny cached PNG thumbnail (~15-25 KB) for the bookshelf.
+  Future<String?> generateCoverThumbnail(BookModel book) async {
+    if (book.thumbnailPath != null && await File(book.thumbnailPath!).exists()) {
+      return book.thumbnailPath;
+    }
+
+    try {
+      final cacheDir = await getTemporaryDirectory();
+      final coversDir = Directory(p.join(cacheDir.path, 'book_covers'));
+      if (!await coversDir.exists()) {
+        await coversDir.create(recursive: true);
+      }
+
+      final safeName = '${book.filePath.hashCode.abs()}.png';
+      final outPath = p.join(coversDir.path, safeName);
+      final outFile = File(outPath);
+
+      if (await outFile.exists()) {
+        book.thumbnailPath = outPath;
+        await _storageService.saveBookProgress(book);
+        return outPath;
+      }
+
+      final doc = await PdfDocument.openFile(book.filePath);
+      try {
+        if (doc.pages.isEmpty) return null;
+        final page = doc.pages.first;
+        const targetWidth = 180.0;
+        final scale = targetWidth / page.width;
+        final targetHeight = (page.height * scale).round();
+
+        final pdfImage = await page.render(
+          width: targetWidth.round(),
+          height: targetHeight,
+        );
+        if (pdfImage == null) return null;
+
+        final uiImage = await pdfImage.createImage();
+        pdfImage.dispose();
+
+        final byteData =
+        await uiImage.toByteData(format: ui.ImageByteFormat.png);
+        uiImage.dispose();
+
+        if (byteData != null) {
+          await outFile.writeAsBytes(byteData.buffer.asUint8List());
+          book.thumbnailPath = outPath;
+          book.totalPages = doc.pages.length;
+          await _storageService.saveBookProgress(book);
+          return outPath;
+        }
+      } finally {
+        await doc.dispose();
+      }
+    } catch (_) {
+      // Fallback to default book icon if PDF is password-protected or malformed
+    }
+    return null;
   }
 }
