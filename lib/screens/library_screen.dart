@@ -491,7 +491,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
             itemBuilder: (_) => const [
               PopupMenuItem(
                 value: _SortOption.recent,
-                child: Text('Sort: Recently Read'),
+                child: Text('Sort: All'),
               ),
               PopupMenuItem(
                 value: _SortOption.added,
