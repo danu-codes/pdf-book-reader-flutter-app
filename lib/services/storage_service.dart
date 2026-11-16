@@ -12,7 +12,16 @@ typedef BookLibraryMap = Map<String, BookModel>;
 class StorageService {
   static const String _dbName = 'lumina_reader.db';
   static const String _tableBooks = 'books';
+  static const String _tableStats = 'reading_stats';
   static const String _legacyPrefsKey = 'lumina_library_books_v2';
+
+  /// Fixed public location that survives Clear Cache, Clear Data, and Uninstall
+  static const String fixedBackupDirPath =
+      '/storage/emulated/0/Download/LuminaReaderBackup';
+  static const String autoBackupFileName = 'lumina_auto_backup.json';
+
+  static String get fixedBackupFilePath =>
+      p.join(fixedBackupDirPath, autoBackupFileName);
 
   static Database? _db;
   static Timer? _debounce;
@@ -25,7 +34,7 @@ class StorageService {
 
     _db = await openDatabase(
       dbPath,
-      version: 1,
+      version: 2,
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE $_tableBooks (
@@ -41,11 +50,32 @@ class StorageService {
             isManuallyFinished INTEGER NOT NULL
           )
         ''');
+        await _createStatsTable(db);
+      },
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          await _createStatsTable(db);
+        }
       },
     );
 
     await _migrateFromLegacyPrefs(_db!);
     return _db!;
+  }
+
+  Future<void> _createStatsTable(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS $_tableStats (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        archivedFinishedCount INTEGER NOT NULL DEFAULT 0,
+        archivedPagesRead INTEGER NOT NULL DEFAULT 0
+      )
+    ''');
+    await db.insert(
+      _tableStats,
+      {'id': 1, 'archivedFinishedCount': 0, 'archivedPagesRead': 0},
+      conflictAlgorithm: ConflictAlgorithm.ignore,
+    );
   }
 
   Future<void> _migrateFromLegacyPrefs(Database db) async {
@@ -117,6 +147,7 @@ class StorageService {
       if (await File(book.filePath).exists()) {
         validBooks.add(book);
       } else {
+        await _archiveBookStats(db, book);
         missingPaths.add(book.filePath);
       }
     }
@@ -127,6 +158,7 @@ class StorageService {
         batch.delete(_tableBooks, where: 'filePath = ?', whereArgs: [path]);
       }
       await batch.commit(noResult: true);
+      await syncAutoBackupNow();
     }
 
     validBooks.sort((a, b) {
@@ -141,6 +173,29 @@ class StorageService {
     return validBooks;
   }
 
+  Future<void> _archiveBookStats(Database db, BookModel book) async {
+    final isFinished = book.shelf == ReadingShelf.finished ? 1 : 0;
+    final pagesRead = book.lastPage > 1 ? book.lastPage : 0;
+    if (isFinished == 0 && pagesRead == 0) return;
+
+    await db.rawUpdate('''
+      UPDATE $_tableStats
+      SET archivedFinishedCount = archivedFinishedCount + ?,
+          archivedPagesRead = archivedPagesRead + ?
+      WHERE id = 1
+    ''', [isFinished, pagesRead]);
+  }
+
+  Future<({int archivedFinished, int archivedPages})> getArchivedStats() async {
+    final db = await database;
+    final rows = await db.query(_tableStats, where: 'id = 1');
+    if (rows.isEmpty) return (archivedFinished: 0, archivedPages: 0);
+    return (
+    archivedFinished: rows.first['archivedFinishedCount'] as int? ?? 0,
+    archivedPages: rows.first['archivedPagesRead'] as int? ?? 0,
+    );
+  }
+
   Future<void> addBooksToLibrary(List<BookModel> books) async {
     final db = await database;
     final batch = db.batch();
@@ -152,23 +207,31 @@ class StorageService {
       );
     }
     await batch.commit(noResult: true);
+    await syncAutoBackupNow();
   }
 
   Future<void> removeBookFromLibrary(String filePath) async {
     final db = await database;
     final rows = await db.query(
       _tableBooks,
-      columns: ['thumbnailPath'],
       where: 'filePath = ?',
       whereArgs: [filePath],
     );
     if (rows.isNotEmpty) {
-      final thumbPath = rows.first['thumbnailPath'] as String?;
-      if (thumbPath != null && await File(thumbPath).exists()) {
-        await File(thumbPath).delete();
+      final book = _fromRow(rows.first);
+      await _archiveBookStats(db, book);
+
+      if (book.thumbnailPath != null &&
+          await File(book.thumbnailPath!).exists()) {
+        await File(book.thumbnailPath!).delete();
+      }
+
+      if (filePath.contains('library_pdfs') && await File(filePath).exists()) {
+        await File(filePath).delete();
       }
     }
     await db.delete(_tableBooks, where: 'filePath = ?', whereArgs: [filePath]);
+    await syncAutoBackupNow();
   }
 
   Future<void> resetBookProgress(BookModel book) async {
@@ -201,6 +264,7 @@ class StorageService {
       _toRow(book),
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
+    await syncAutoBackupNow();
   }
 
   Future<void> flushNow() async {
@@ -211,31 +275,109 @@ class StorageService {
     }
   }
 
-  /// Exports all library metadata, reading pages, and bookmarks as JSON.
-  Future<String> exportLibraryBackupJson() async {
-    final books = await getLibraryBooks();
-    return BookModel.encodeList(books);
+  // ---------------------------------------------------------------------------
+  // Fixed-Location Auto-Backup & Restore (/Download/LuminaReaderBackup/)
+  // ---------------------------------------------------------------------------
+
+  Future<bool> hasExistingBackupFile() async {
+    try {
+      return await File(fixedBackupFilePath).exists();
+    } catch (_) {
+      return false;
+    }
   }
 
-  /// Restores reading progress & bookmarks from a JSON backup for matching files.
-  Future<int> importLibraryBackupJson(String jsonStr) async {
-    final imported = BookModel.decodeList(jsonStr);
-    final db = await database;
-    final batch = db.batch();
-    int restored = 0;
+  /// Automatically writes the full SQLite state (books + lifetime stats)
+  /// to /storage/emulated/0/Download/LuminaReaderBackup/lumina_auto_backup.json
+  Future<bool> syncAutoBackupNow() async {
+    try {
+      final dir = Directory(fixedBackupDirPath);
+      if (!await dir.exists()) {
+        await dir.create(recursive: true);
+      }
+      final jsonStr = await exportFullStateJson();
+      final backupFile = File(fixedBackupFilePath);
+      await backupFile.writeAsString(jsonStr, flush: true);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
 
-    for (final book in imported) {
+  Future<String> exportFullStateJson() async {
+    final db = await database;
+    final rows = await db.query(_tableBooks);
+    final books = rows.map(_fromRow).toList();
+    final stats = await getArchivedStats();
+
+    final payload = {
+      'version': 2,
+      'updatedAt': DateTime.now().toIso8601String(),
+      'archivedFinishedCount': stats.archivedFinished,
+      'archivedPagesRead': stats.archivedPages,
+      'books': books.map((b) => b.toJson()).toList(),
+    };
+    return jsonEncode(payload);
+  }
+
+  /// Reads directly from /storage/emulated/0/Download/LuminaReaderBackup/lumina_auto_backup.json
+  /// and restores all books, bookmarks, reading pages, and lifetime stats.
+  Future<({int restoredBooks, int finishedCount, int pagesRead})?>
+  restoreFromFixedBackupLocation() async {
+    final backupFile = File(fixedBackupFilePath);
+    if (!await backupFile.exists()) return null;
+
+    final jsonStr = await backupFile.readAsString();
+    final db = await database;
+    final decoded = jsonDecode(jsonStr);
+
+    int archivedFinished = 0;
+    int archivedPages = 0;
+    List<BookModel> books = [];
+
+    if (decoded is Map<String, dynamic>) {
+      archivedFinished = decoded['archivedFinishedCount'] as int? ?? 0;
+      archivedPages = decoded['archivedPagesRead'] as int? ?? 0;
+      final rawBooks = decoded['books'] as List<dynamic>? ?? [];
+      books = rawBooks
+          .map((e) => BookModel.fromJson(e as Map<String, dynamic>))
+          .toList();
+    } else if (decoded is List) {
+      books = BookModel.decodeList(jsonStr);
+    }
+
+    int restoredCount = 0;
+    final batch = db.batch();
+
+    for (final book in books) {
       if (await File(book.filePath).exists()) {
         batch.insert(
           _tableBooks,
           _toRow(book),
           conflictAlgorithm: ConflictAlgorithm.replace,
         );
-        restored++;
+        restoredCount++;
+      } else {
+        if (book.shelf == ReadingShelf.finished) archivedFinished++;
+        if (book.lastPage > 1) archivedPages += book.lastPage;
       }
     }
+
+    batch.rawUpdate('''
+      UPDATE $_tableStats
+      SET archivedFinishedCount = ?,
+          archivedPagesRead = ?
+      WHERE id = 1
+    ''', [archivedFinished, archivedPages]);
+
     await batch.commit(noResult: true);
-    return restored;
+    await syncAutoBackupNow();
+
+    return (
+    restoredBooks: restoredCount,
+    finishedCount: archivedFinished,
+    pagesRead: archivedPages,
+    );
   }
 
   Future<int> getCoverStorageBytes() async {

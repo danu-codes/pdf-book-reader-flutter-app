@@ -1,9 +1,7 @@
-import 'dart:io';
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
 import '../models/book_model.dart';
 import '../services/pdf_scanner_service.dart';
 import '../services/storage_service.dart';
@@ -36,6 +34,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
   bool _defaultHorizontal = false;
   bool _keepScreenAwake = true;
   int _coverStorageBytes = 0;
+  int _archivedFinished = 0;
+  int _archivedPages = 0;
+  bool _backupExists = false;
 
   @override
   void initState() {
@@ -44,36 +45,52 @@ class _LibraryScreenState extends State<LibraryScreen> {
   }
 
   Future<void> _initFast() async {
-    await Future.wait([
-      _reloadBooks(),
-      _loadReaderPreferences(),
-    ]);
-    // Defer legacy cleanup so first frame & splash finish immediately
+    await _ensureBackupFolderPermission();
+    await Future.wait([_reloadBooks(), _loadReaderPreferences()]);
     Future.delayed(const Duration(seconds: 2), () {
       _storage.cleanupLegacyDuplicates();
     });
+
+    // If database is empty (fresh install or after Clear App Data) AND
+    // lumina_auto_backup.json exists in /Download/LuminaReaderBackup/,
+    // ask permission to restore immediately.
+    if (mounted &&
+        _books.isEmpty &&
+        _archivedFinished == 0 &&
+        _archivedPages == 0 &&
+        _backupExists) {
+      _promptRestoreFromFixedBackup();
+    }
   }
 
-  Future<void> _loadReaderPreferences() async {
-    final prefs = await SharedPreferences.getInstance();
-    final coverBytes = await _storage.getCoverStorageBytes();
-    if (!mounted) return;
-    setState(() {
-      _defaultThemeIndex = prefs.getInt('reader_theme_mode') ?? 0;
-      _defaultHorizontal = prefs.getBool('reader_horizontal') ?? false;
-      _keepScreenAwake = prefs.getBool('reader_wakelock') ?? true;
-      _coverStorageBytes = coverBytes;
-    });
+  Future<void> _ensureBackupFolderPermission() async {
+    if (await Permission.manageExternalStorage.isGranted) return;
+    await Permission.manageExternalStorage.request();
   }
 
   Future<void> _reloadBooks() async {
     final books = await _storage.getLibraryBooks();
     final coverBytes = await _storage.getCoverStorageBytes();
+    final archived = await _storage.getArchivedStats();
+    final hasBackup = await _storage.hasExistingBackupFile();
     if (!mounted) return;
     setState(() {
       _books = books;
       _coverStorageBytes = coverBytes;
+      _archivedFinished = archived.archivedFinished;
+      _archivedPages = archived.archivedPages;
+      _backupExists = hasBackup;
       _isLoading = false;
+    });
+  }
+
+  Future<void> _loadReaderPreferences() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(() {
+      _defaultThemeIndex = prefs.getInt('reader_theme_mode') ?? 0;
+      _defaultHorizontal = prefs.getBool('reader_horizontal') ?? false;
+      _keepScreenAwake = prefs.getBool('reader_wakelock') ?? true;
     });
   }
 
@@ -103,12 +120,13 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
     switch (_sortOption) {
       case _SortOption.recent:
-        break; // Already sorted by lastOpened in StorageService
+        break;
       case _SortOption.added:
         filtered.sort((a, b) => b.dateAdded.compareTo(a.dateAdded));
       case _SortOption.title:
         filtered.sort(
-                (a, b) => a.title.toLowerCase().compareTo(b.title.toLowerCase()));
+              (a, b) => a.title.toLowerCase().compareTo(b.title.toLowerCase()),
+        );
       case _SortOption.progress:
         filtered.sort((a, b) => b.progress.compareTo(a.progress));
     }
@@ -140,32 +158,58 @@ class _LibraryScreenState extends State<LibraryScreen> {
     }
   }
 
-  Future<void> _exportBackup() async {
-    final jsonStr = await _storage.exportLibraryBackupJson();
-    final dir = await getExternalStorageDirectory() ??
-        await getApplicationDocumentsDirectory();
-    final filePath = p.join(dir.path, 'lumina_library_backup.json');
-    await File(filePath).writeAsString(jsonStr);
+  Future<void> _promptRestoreFromFixedBackup() async {
     if (!mounted) return;
-    Navigator.pop(context);
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('Backup saved to: $filePath')),
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.restore_rounded, size: 36),
+        title: const Text('Restore Previous Backup?'),
+        content: const Text(
+          'Found an existing backup in Download/LuminaReaderBackup/lumina_auto_backup.json.\n\nDo you want to restore your finished books count, pages read, bookmarks, and library?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Not Now'),
+          ),
+          FilledButton.icon(
+            onPressed: () async {
+              Navigator.pop(ctx);
+              await _restoreNowFromFixedFolder();
+            },
+            icon: const Icon(Icons.check_rounded),
+            label: const Text('Restore All Data'),
+          ),
+        ],
+      ),
     );
   }
 
-  Future<void> _importBackup() async {
-    final picked = await FilePicker.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: ['json'],
-    );
-    if (picked.isEmpty || picked.first.path == null) return;
-    final jsonStr = await File(picked.first.path!).readAsString();
-    final count = await _storage.importLibraryBackupJson(jsonStr);
+  Future<void> _restoreNowFromFixedFolder() async {
+    await _ensureBackupFolderPermission();
+    final result = await _storage.restoreFromFixedBackupLocation();
     await _reloadBooks();
     if (!mounted) return;
-    Navigator.pop(context);
+
+    if (result == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'No backup found at Download/LuminaReaderBackup/lumina_auto_backup.json',
+          ),
+        ),
+      );
+      return;
+    }
+
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('Restored progress for $count books')),
+      SnackBar(
+        content: Text(
+          'Restored ${result.restoredBooks} books, ${result.finishedCount} finished, and ${result.pagesRead} pages read!',
+        ),
+      ),
     );
   }
 
@@ -182,8 +226,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 book.title,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-                style:
-                const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                style: const TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                ),
               ),
             ),
             ListTile(
@@ -200,9 +246,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     ? Icons.undo_rounded
                     : Icons.check_circle_outline_rounded,
               ),
-              title: Text(book.isManuallyFinished
-                  ? 'Mark as Unfinished'
-                  : 'Mark as Finished'),
+              title: Text(
+                book.isManuallyFinished
+                    ? 'Mark as Unfinished'
+                    : 'Mark as Finished',
+              ),
               onTap: () async {
                 Navigator.pop(ctx);
                 book.isManuallyFinished = !book.isManuallyFinished;
@@ -220,13 +268,15 @@ class _LibraryScreenState extends State<LibraryScreen> {
               },
             ),
             ListTile(
-              leading: Icon(Icons.delete_outline_rounded,
-                  color: Theme.of(context).colorScheme.error),
+              leading: Icon(
+                Icons.delete_outline_rounded,
+                color: Theme.of(context).colorScheme.error,
+              ),
               title: Text(
                 'Remove from Library',
                 style: TextStyle(color: Theme.of(context).colorScheme.error),
               ),
-              subtitle: const Text('Keeps original PDF file on your phone'),
+              subtitle: const Text('Keeps original PDF file & reading stats'),
               onTap: () async {
                 Navigator.pop(ctx);
                 await _storage.removeBookFromLibrary(book.filePath);
@@ -274,12 +324,14 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   Widget _buildSidebarDrawer(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    final finishedCount =
+    final finishedCount = _archivedFinished +
         _books.where((b) => b.shelf == ReadingShelf.finished).length;
-    final totalPagesRead =
-    _books.fold<int>(0, (sum, b) => sum + (b.lastPage > 1 ? b.lastPage : 0));
-    final totalBookmarks =
-    _books.fold<int>(0, (sum, b) => sum + b.bookmarks.length);
+    final totalPagesRead = _archivedPages +
+        _books.fold<int>(0, (sum, b) => sum + (b.lastPage > 1 ? b.lastPage : 0));
+    final totalBookmarks = _books.fold<int>(
+      0,
+          (sum, b) => sum + b.bookmarks.length,
+    );
     final coverKb = (_coverStorageBytes / 1024).toStringAsFixed(0);
 
     return Drawer(
@@ -297,8 +349,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 children: [
                   Row(
                     children: [
-                      Icon(Icons.auto_stories_rounded,
-                          size: 30, color: cs.primary),
+                      Icon(
+                        Icons.auto_stories_rounded,
+                        size: 30,
+                        color: cs.primary,
+                      ),
                       const SizedBox(width: 10),
                       Text(
                         'Lumina Reader',
@@ -328,9 +383,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
               child: Text(
                 'SHELVES',
                 style: TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 0.8),
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.8,
+                ),
               ),
             ),
             ListTile(
@@ -375,9 +431,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
               child: Text(
                 'READER SETTINGS',
                 style: TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 0.8),
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.8,
+                ),
               ),
             ),
             ListTile(
@@ -398,7 +455,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
             SwitchListTile(
               secondary: const Icon(Icons.swap_horiz_rounded),
               title: const Text('Horizontal Page Flip'),
-              subtitle: const Text('Swipe left/right instead of vertical scroll'),
+              subtitle: const Text(
+                'Swipe left/right instead of vertical scroll',
+              ),
               value: _defaultHorizontal,
               onChanged: (val) async {
                 final prefs = await SharedPreferences.getInstance();
@@ -421,24 +480,36 @@ class _LibraryScreenState extends State<LibraryScreen> {
             const Padding(
               padding: EdgeInsets.fromLTRB(16, 8, 16, 4),
               child: Text(
-                'DATA & BACKUP',
+                'AUTO-BACKUP & RESTORE',
                 style: TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 0.8),
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.8,
+                ),
               ),
             ),
             ListTile(
-              leading: const Icon(Icons.upload_file_rounded),
-              title: const Text('Export Reading Progress'),
-              subtitle: const Text('Save bookmarks & pages to JSON'),
-              onTap: _exportBackup,
+              leading: Icon(
+                _backupExists
+                    ? Icons.cloud_done_rounded
+                    : Icons.sync_rounded,
+                color: cs.primary,
+              ),
+              title: const Text('Auto-Backup Location'),
+              subtitle: const Text(
+                'Download/LuminaReaderBackup/lumina_auto_backup.json\n(Auto-saved on every change)',
+              ),
             ),
             ListTile(
               leading: const Icon(Icons.restore_page_rounded),
-              title: const Text('Restore Progress Backup'),
-              subtitle: const Text('Import from JSON backup file'),
-              onTap: _importBackup,
+              title: const Text('Restore from Auto-Backup'),
+              subtitle: const Text(
+                'Recover stats & books from Download/LuminaReaderBackup',
+              ),
+              onTap: () async {
+                Navigator.pop(context);
+                await _restoreNowFromFixedFolder();
+              },
             ),
             ListTile(
               leading: const Icon(Icons.storage_rounded),
@@ -458,10 +529,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
           value,
           style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
         ),
-        Text(
-          label,
-          style: const TextStyle(fontSize: 11),
-        ),
+        Text(label, style: const TextStyle(fontSize: 11)),
       ],
     );
   }
@@ -491,7 +559,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
             itemBuilder: (_) => const [
               PopupMenuItem(
                 value: _SortOption.recent,
-                child: Text('Sort: All'),
+                child: Text('Sort: Recently Read'),
               ),
               PopupMenuItem(
                 value: _SortOption.added,
@@ -608,7 +676,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
             ),
             const SizedBox(height: 8),
             const Text(
-              'Add PDF books from Downloads, Documents, or any folder on your phone. Your progress and bookmarks are saved in SQLite.',
+              'Add PDF books from Downloads, Documents, or any folder on your phone. Your progress and stats auto-backup to Download/LuminaReaderBackup.',
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 20),
