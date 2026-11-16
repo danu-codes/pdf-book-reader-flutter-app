@@ -24,6 +24,7 @@ class BookCoverThumbnail extends StatefulWidget {
 class _BookCoverThumbnailState extends State<BookCoverThumbnail> {
   static final PdfScannerService _scanner = PdfScannerService();
   String? _thumbPath;
+  int _loadGeneration = 0;
 
   @override
   void initState() {
@@ -36,19 +37,30 @@ class _BookCoverThumbnailState extends State<BookCoverThumbnail> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.book.filePath != widget.book.filePath ||
         oldWidget.book.thumbnailPath != widget.book.thumbnailPath) {
+      _thumbPath = null;
       _loadThumbnail();
     }
   }
 
   Future<void> _loadThumbnail() async {
+    final generation = ++_loadGeneration;
+    final targetFilePath = widget.book.filePath;
+
     final existing = widget.book.thumbnailPath;
     if (existing != null && await File(existing).exists()) {
-      if (mounted) setState(() => _thumbPath = existing);
+      if (mounted &&
+          generation == _loadGeneration &&
+          widget.book.filePath == targetFilePath) {
+        setState(() => _thumbPath = existing);
+      }
       return;
     }
 
     final generated = await _scanner.generateCoverThumbnail(widget.book);
-    if (mounted && generated != null) {
+    if (mounted &&
+        generated != null &&
+        generation == _loadGeneration &&
+        widget.book.filePath == targetFilePath) {
       setState(() => _thumbPath = generated);
     }
   }
@@ -75,7 +87,9 @@ class _BookCoverThumbnailState extends State<BookCoverThumbnail> {
       child: _thumbPath != null
           ? Image.file(
         File(_thumbPath!),
+        key: ValueKey(_thumbPath),
         fit: BoxFit.cover,
+        alignment: Alignment.topCenter,
         cacheWidth: (widget.width * 2).round(),
         errorBuilder: (_, __, ___) => _fallbackIcon(cs),
       )

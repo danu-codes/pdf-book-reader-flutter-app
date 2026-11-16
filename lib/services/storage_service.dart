@@ -1,12 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sqflite/sqflite.dart';
-
 import '../models/book_model.dart';
 
 typedef BookLibraryMap = Map<String, BookModel>;
@@ -15,9 +13,9 @@ class StorageService {
   static const String _dbName = 'lumina_reader.db';
   static const String _tableBooks = 'books';
   static const String _tableStats = 'reading_stats';
+  static const String _tableArchivedBooks = 'archived_books';
   static const String _legacyPrefsKey = 'lumina_library_books_v2';
 
-  /// Fixed public location that survives Clear Cache, Clear Data, and Uninstall
   static const String fixedBackupDirPath =
       '/storage/emulated/0/Download/LuminaReaderBackup';
   static const String autoBackupFileName = 'lumina_auto_backup.json';
@@ -36,7 +34,7 @@ class StorageService {
 
     _db = await openDatabase(
       dbPath,
-      version: 2,
+      version: 3,
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE $_tableBooks (
@@ -48,15 +46,22 @@ class StorageService {
             lastOpened TEXT,
             dateAdded TEXT NOT NULL,
             bookmarks TEXT NOT NULL,
+            visitedPages TEXT NOT NULL DEFAULT '[]',
             thumbnailPath TEXT,
             isManuallyFinished INTEGER NOT NULL
           )
         ''');
-        await _createStatsTable(db);
+        await _createStatsTables(db);
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
-          await _createStatsTable(db);
+          await _createStatsTables(db);
+        }
+        if (oldVersion < 3) {
+          await db.execute(
+            "ALTER TABLE $_tableBooks ADD COLUMN visitedPages TEXT NOT NULL DEFAULT '[]'",
+          );
+          await _createArchivedBooksTable(db);
         }
       },
     );
@@ -65,7 +70,7 @@ class StorageService {
     return _db!;
   }
 
-  Future<void> _createStatsTable(Database db) async {
+  Future<void> _createStatsTables(Database db) async {
     await db.execute('''
       CREATE TABLE IF NOT EXISTS $_tableStats (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -73,11 +78,22 @@ class StorageService {
         archivedPagesRead INTEGER NOT NULL DEFAULT 0
       )
     ''');
-    await db.insert(_tableStats, {
-      'id': 1,
-      'archivedFinishedCount': 0,
-      'archivedPagesRead': 0,
-    }, conflictAlgorithm: ConflictAlgorithm.ignore);
+    await db.insert(
+      _tableStats,
+      {'id': 1, 'archivedFinishedCount': 0, 'archivedPagesRead': 0},
+      conflictAlgorithm: ConflictAlgorithm.ignore,
+    );
+    await _createArchivedBooksTable(db);
+  }
+
+  Future<void> _createArchivedBooksTable(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS $_tableArchivedBooks (
+        fingerprint TEXT PRIMARY KEY,
+        creditedFinished INTEGER NOT NULL DEFAULT 0,
+        creditedPages INTEGER NOT NULL DEFAULT 0
+      )
+    ''');
   }
 
   Future<void> _migrateFromLegacyPrefs(Database db) async {
@@ -107,6 +123,7 @@ class StorageService {
     'lastOpened': b.lastOpened?.toIso8601String(),
     'dateAdded': b.dateAdded.toIso8601String(),
     'bookmarks': jsonEncode(b.bookmarks),
+    'visitedPages': jsonEncode(b.visitedPages),
     'thumbnailPath': b.thumbnailPath,
     'isManuallyFinished': b.isManuallyFinished ? 1 : 0,
   };
@@ -126,6 +143,10 @@ class StorageService {
     bookmarks: (jsonDecode(row['bookmarks'] as String? ?? '[]') as List)
         .map((e) => e as int)
         .toList(),
+    visitedPages:
+    (jsonDecode(row['visitedPages'] as String? ?? '[]') as List)
+        .map((e) => e as int)
+        .toList(),
     thumbnailPath: row['thumbnailPath'] as String?,
     isManuallyFinished: (row['isManuallyFinished'] as int? ?? 0) == 1,
   );
@@ -133,7 +154,9 @@ class StorageService {
   Future<BookLibraryMap> getLibraryMap() async {
     final db = await database;
     final rows = await db.query(_tableBooks);
-    return {for (final r in rows) r['filePath'] as String: _fromRow(r)};
+    return {
+      for (final r in rows) r['filePath'] as String: _fromRow(r),
+    };
   }
 
   Future<List<BookModel>> getLibraryBooks() async {
@@ -147,7 +170,7 @@ class StorageService {
       if (await File(book.filePath).exists()) {
         validBooks.add(book);
       } else {
-        await _archiveBookStats(db, book);
+        await _archiveBookStatsDeduped(db, book);
         missingPaths.add(book.filePath);
       }
     }
@@ -173,20 +196,61 @@ class StorageService {
     return validBooks;
   }
 
-  Future<void> _archiveBookStats(Database db, BookModel book) async {
-    final isFinished = book.shelf == ReadingShelf.finished ? 1 : 0;
-    final pagesRead = book.lastPage > 1 ? book.lastPage : 0;
-    if (isFinished == 0 && pagesRead == 0) return;
+  /// Banks a book's stats without double-counting if the same book was
+  /// previously archived, removed, and re-added.
+  Future<void> _archiveBookStatsDeduped(
+      Database db,
+      BookModel book, {
+        bool? userConfirmedFinished,
+      }) async {
+    final isFinished = userConfirmedFinished ??
+        (book.isManuallyFinished ||
+            (book.totalPages > 0 &&
+                book.visitedPages.length >= book.totalPages));
 
-    await db.rawUpdate(
-      '''
-      UPDATE $_tableStats
-      SET archivedFinishedCount = archivedFinishedCount + ?,
-          archivedPagesRead = archivedPagesRead + ?
-      WHERE id = 1
-    ''',
-      [isFinished, pagesRead],
+    final int newCreditedFinished = isFinished ? 1 : 0;
+    final int newCreditedPages = (isFinished && book.totalPages > 0)
+        ? book.totalPages
+        : book.visitedPages.length;
+
+    final existing = await db.query(
+      _tableArchivedBooks,
+      where: 'fingerprint = ?',
+      whereArgs: [book.uniqueFingerprint],
     );
+
+    final prevFinished = existing.isNotEmpty
+        ? (existing.first['creditedFinished'] as int? ?? 0)
+        : 0;
+    final prevPages = existing.isNotEmpty
+        ? (existing.first['creditedPages'] as int? ?? 0)
+        : 0;
+
+    final deltaFinished =
+    newCreditedFinished > prevFinished ? newCreditedFinished - prevFinished : 0;
+    final deltaPages =
+    newCreditedPages > prevPages ? newCreditedPages - prevPages : 0;
+
+    if (deltaFinished > 0 || deltaPages > 0) {
+      await db.rawUpdate('''
+        UPDATE $_tableStats
+        SET archivedFinishedCount = archivedFinishedCount + ?,
+            archivedPagesRead = archivedPagesRead + ?
+        WHERE id = 1
+      ''', [deltaFinished, deltaPages]);
+
+      await db.insert(
+        _tableArchivedBooks,
+        {
+          'fingerprint': book.uniqueFingerprint,
+          'creditedFinished':
+          newCreditedFinished > prevFinished ? newCreditedFinished : prevFinished,
+          'creditedPages':
+          newCreditedPages > prevPages ? newCreditedPages : prevPages,
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+    }
   }
 
   Future<({int archivedFinished, int archivedPages})> getArchivedStats() async {
@@ -194,8 +258,49 @@ class StorageService {
     final rows = await db.query(_tableStats, where: 'id = 1');
     if (rows.isEmpty) return (archivedFinished: 0, archivedPages: 0);
     return (
-      archivedFinished: rows.first['archivedFinishedCount'] as int? ?? 0,
-      archivedPages: rows.first['archivedPagesRead'] as int? ?? 0,
+    archivedFinished: rows.first['archivedFinishedCount'] as int? ?? 0,
+    archivedPages: rows.first['archivedPagesRead'] as int? ?? 0,
+    );
+  }
+
+  /// Computes live totals (archived + active shelf) while subtracting any
+  /// already-archived credit for books that were re-added so stats never double-count.
+  Future<({int totalFinished, int totalPagesRead})> getCombinedStats(
+      List<BookModel> activeBooks,
+      ) async {
+    final db = await database;
+    final archived = await getArchivedStats();
+    final archivedRows = await db.query(_tableArchivedBooks);
+    final archivedMap = {
+      for (final r in archivedRows)
+        r['fingerprint'] as String: (
+        finished: r['creditedFinished'] as int? ?? 0,
+        pages: r['creditedPages'] as int? ?? 0,
+        ),
+    };
+
+    int extraActiveFinished = 0;
+    int extraActivePages = 0;
+
+    for (final book in activeBooks) {
+      final prev = archivedMap[book.uniqueFingerprint];
+      final activeFinished = book.shelf == ReadingShelf.finished ? 1 : 0;
+      final activePages = book.effectivePagesRead;
+
+      final prevFin = prev?.finished ?? 0;
+      final prevPag = prev?.pages ?? 0;
+
+      if (activeFinished > prevFin) {
+        extraActiveFinished += activeFinished - prevFin;
+      }
+      if (activePages > prevPag) {
+        extraActivePages += activePages - prevPag;
+      }
+    }
+
+    return (
+    totalFinished: archived.archivedFinished + extraActiveFinished,
+    totalPagesRead: archived.archivedPages + extraActivePages,
     );
   }
 
@@ -213,7 +318,12 @@ class StorageService {
     await syncAutoBackupNow();
   }
 
-  Future<void> removeBookFromLibrary(String filePath) async {
+  /// Removes a book from the shelf and records its stats based on whether
+  /// the user confirmed finishing it, preventing double-counting on re-add.
+  Future<void> removeBookFromLibrary(
+      String filePath, {
+        bool? userConfirmedFinished,
+      }) async {
     final db = await database;
     final rows = await db.query(
       _tableBooks,
@@ -222,7 +332,11 @@ class StorageService {
     );
     if (rows.isNotEmpty) {
       final book = _fromRow(rows.first);
-      await _archiveBookStats(db, book);
+      await _archiveBookStatsDeduped(
+        db,
+        book,
+        userConfirmedFinished: userConfirmedFinished,
+      );
 
       if (book.thumbnailPath != null &&
           await File(book.thumbnailPath!).exists()) {
@@ -240,14 +354,12 @@ class StorageService {
   Future<void> resetBookProgress(BookModel book) async {
     book.lastPage = 1;
     book.lastOpened = null;
+    book.visitedPages.clear();
     book.isManuallyFinished = false;
     await saveBookProgress(book, immediate: true);
   }
 
-  Future<void> saveBookProgress(
-    BookModel book, {
-    bool immediate = false,
-  }) async {
+  Future<void> saveBookProgress(BookModel book, {bool immediate = false}) async {
     _pendingBook = book;
     _debounce?.cancel();
     if (immediate) {
@@ -293,8 +405,6 @@ class StorageService {
     }
   }
 
-  /// Automatically writes the full SQLite state (books + lifetime stats)
-  /// to /storage/emulated/0/Download/LuminaReaderBackup/lumina_auto_backup.json
   Future<bool> syncAutoBackupNow() async {
     try {
       final dir = Directory(fixedBackupDirPath);
@@ -315,22 +425,19 @@ class StorageService {
     final rows = await db.query(_tableBooks);
     final books = rows.map(_fromRow).toList();
     final stats = await getArchivedStats();
+    final archivedLedger = await db.query(_tableArchivedBooks);
 
     final payload = {
-      'version': 2,
+      'version': 3,
       'updatedAt': DateTime.now().toIso8601String(),
       'archivedFinishedCount': stats.archivedFinished,
       'archivedPagesRead': stats.archivedPages,
+      'archivedBooksLedger': archivedLedger,
       'books': books.map((b) => b.toJson()).toList(),
     };
     return jsonEncode(payload);
   }
 
-  /// Reads directly from /storage/emulated/0/Download/LuminaReaderBackup/lumina_auto_backup.json
-  /// and restores all books, bookmarks, reading pages, and lifetime stats.
-  /// Reads directly from /storage/emulated/0/Download/LuminaReaderBackup/lumina_auto_backup.json
-  /// and restores all books (with exact lastPage, totalPages, bookmarks & shelf status)
-  /// plus lifetime archived stats.
   Future<({int restoredBooks, int finishedCount, int pagesRead})?>
   restoreFromFixedBackupLocation() async {
     final backupFile = File(fixedBackupFilePath);
@@ -343,10 +450,12 @@ class StorageService {
     int archivedFinished = 0;
     int archivedPages = 0;
     List<BookModel> books = [];
+    List<dynamic> ledgerRows = [];
 
     if (decoded is Map<String, dynamic>) {
       archivedFinished = decoded['archivedFinishedCount'] as int? ?? 0;
       archivedPages = decoded['archivedPagesRead'] as int? ?? 0;
+      ledgerRows = decoded['archivedBooksLedger'] as List<dynamic>? ?? [];
       final rawBooks = decoded['books'] as List<dynamic>? ?? [];
       books = rawBooks
           .map((e) => BookModel.fromJson(e as Map<String, dynamic>))
@@ -355,15 +464,30 @@ class StorageService {
       books = BookModel.decodeList(jsonStr);
     }
 
-    int restoredCount = 0;
     final batch = db.batch();
+
+    for (final entry in ledgerRows) {
+      if (entry is Map<String, dynamic>) {
+        batch.insert(
+          _tableArchivedBooks,
+          {
+            'fingerprint': entry['fingerprint'] as String,
+            'creditedFinished': entry['creditedFinished'] as int? ?? 0,
+            'creditedPages': entry['creditedPages'] as int? ?? 0,
+          },
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+      }
+    }
+
+    int restoredCount = 0;
+    final restoredBooksList = <BookModel>[];
 
     for (final book in books) {
       String? resolvedPath;
       if (await File(book.filePath).exists()) {
         resolvedPath = book.filePath;
       } else {
-        // Fallback: check shared backup books folder by filename
         final fallbackPath = p.join(
           fixedBackupDirPath,
           'books',
@@ -374,91 +498,72 @@ class StorageService {
         }
       }
 
-      int restoredCount = 0;
-      int restoredActiveFinished = 0;
-      int restoredActivePages = 0;
-      final batch = db.batch();
+      if (resolvedPath != null) {
+        final validThumb = (book.thumbnailPath != null &&
+            await File(book.thumbnailPath!).exists())
+            ? book.thumbnailPath
+            : null;
 
-      for (final book in books) {
-        String? resolvedPath;
-        if (await File(book.filePath).exists()) {
-          resolvedPath = book.filePath;
-        } else {
-          // Fallback: check shared backup books folder by filename
-          final fallbackPath = p.join(
-            fixedBackupDirPath,
-            'books',
-            p.basename(book.filePath),
-          );
-          if (await File(fallbackPath).exists()) {
-            resolvedPath = fallbackPath;
-          }
-        }
+        final restoredBook = BookModel(
+          filePath: resolvedPath,
+          title: book.title,
+          fileSizeBytes: book.fileSizeBytes,
+          lastPage: book.lastPage,
+          totalPages: book.totalPages,
+          lastOpened: book.lastOpened,
+          dateAdded: book.dateAdded,
+          bookmarks: book.bookmarks,
+          visitedPages: book.visitedPages,
+          thumbnailPath: validThumb,
+          isManuallyFinished: book.isManuallyFinished,
+        );
 
-        if (resolvedPath != null) {
-          final validThumb =
-              (book.thumbnailPath != null &&
-                  await File(book.thumbnailPath!).exists())
-              ? book.thumbnailPath
-              : null;
-
-          final restoredBook = BookModel(
-            filePath: resolvedPath,
-            title: book.title,
-            fileSizeBytes: book.fileSizeBytes,
-            lastPage: book.lastPage,
-            totalPages: book.totalPages,
-            lastOpened: book.lastOpened,
-            dateAdded: book.dateAdded,
-            bookmarks: book.bookmarks,
-            thumbnailPath: validThumb,
-            isManuallyFinished: book.isManuallyFinished,
-          );
-
-          batch.insert(
-            _tableBooks,
-            _toRow(restoredBook),
-            conflictAlgorithm: ConflictAlgorithm.replace,
-          );
-          restoredCount++;
-          if (restoredBook.shelf == ReadingShelf.finished) {
-            restoredActiveFinished++;
-          }
-          if (restoredBook.lastPage > 1) {
-            restoredActivePages += restoredBook.lastPage;
-          }
-        } else {
-          if (book.shelf == ReadingShelf.finished) archivedFinished++;
-          if (book.lastPage > 1) archivedPages += book.lastPage;
-        }
+        batch.insert(
+          _tableBooks,
+          _toRow(restoredBook),
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+        restoredCount++;
+        restoredBooksList.add(restoredBook);
+      } else {
+        final fin = book.shelf == ReadingShelf.finished ? 1 : 0;
+        final pag = book.effectivePagesRead;
+        archivedFinished += fin;
+        archivedPages += pag;
+        batch.insert(
+          _tableArchivedBooks,
+          {
+            'fingerprint': book.uniqueFingerprint,
+            'creditedFinished': fin,
+            'creditedPages': pag,
+          },
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
       }
+    }
 
-      batch.rawUpdate(
-        '''
+    batch.rawUpdate('''
       UPDATE $_tableStats
       SET archivedFinishedCount = ?,
           archivedPagesRead = ?
       WHERE id = 1
-    ''',
-        [archivedFinished, archivedPages],
-      );
+    ''', [archivedFinished, archivedPages]);
 
-      await batch.commit(noResult: true);
-      await syncAutoBackupNow();
+    await batch.commit(noResult: true);
+    await syncAutoBackupNow();
 
-      return (
-        restoredBooks: restoredCount,
-        finishedCount: archivedFinished + restoredActiveFinished,
-        pagesRead: archivedPages + restoredActivePages,
-      );
-    }
+    final combined = await getCombinedStats(restoredBooksList);
+    return (
+    restoredBooks: restoredCount,
+    finishedCount: combined.totalFinished,
+    pagesRead: combined.totalPagesRead,
+    );
   }
 
-  /// Wipes all books from the library, resets lifetime reading stats to 0,
-  /// deletes cached cover thumbnails, and updates lumina_auto_backup.json.
   Future<void> resetAllDataAndStats({bool deleteBackupFiles = false}) async {
     final db = await database;
     await db.delete(_tableBooks);
+    await db.delete(_tableArchivedBooks);
     await db.rawUpdate('''
       UPDATE $_tableStats
       SET archivedFinishedCount = 0,

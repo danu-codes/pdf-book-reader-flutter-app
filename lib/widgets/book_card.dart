@@ -50,7 +50,9 @@ class ContinueReadingHeroCard extends StatelessWidget {
                   children: [
                     Container(
                       padding: const EdgeInsets.symmetric(
-                          horizontal: 8, vertical: 3),
+                        horizontal: 8,
+                        vertical: 3,
+                      ),
                       decoration: BoxDecoration(
                         color: cs.primary.withValues(alpha: 0.15),
                         borderRadius: BorderRadius.circular(6),
@@ -180,7 +182,8 @@ class BookCard extends StatelessWidget {
                         ),
                       ],
                     ),
-                    if (book.totalPages > 0 && shelf != ReadingShelf.wantToRead) ...[
+                    if (book.totalPages > 0 &&
+                        shelf != ReadingShelf.wantToRead) ...[
                       const SizedBox(height: 8),
                       ClipRRect(
                         borderRadius: BorderRadius.circular(4),
@@ -215,9 +218,21 @@ class _ShelfBadge extends StatelessWidget {
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     final (label, bg, fg) = switch (shelf) {
-      ReadingShelf.finished => ('Finished', Colors.green.withValues(alpha: 0.18), Colors.green.shade700),
-      ReadingShelf.reading => ('Reading', cs.primary.withValues(alpha: 0.15), cs.primary),
-      ReadingShelf.wantToRead => ('Unread', cs.surfaceContainerHighest, cs.onSurfaceVariant),
+      ReadingShelf.finished => (
+      'Finished',
+      Colors.green.withValues(alpha: 0.18),
+      Colors.green.shade700,
+      ),
+      ReadingShelf.reading => (
+      'Reading',
+      cs.primary.withValues(alpha: 0.15),
+      cs.primary,
+      ),
+      ReadingShelf.wantToRead => (
+      'Unread',
+      cs.surfaceContainerHighest,
+      cs.onSurfaceVariant,
+      ),
     };
 
     return Container(

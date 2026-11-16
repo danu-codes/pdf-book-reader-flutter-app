@@ -83,7 +83,19 @@ class PdfScannerService {
     return returnedBooks;
   }
 
-  /// Renders Page 1 into persistent App Support storage so Clear Cache keeps covers intact.
+  /// Deterministic 64-bit FNV-1a hash so cover filenames never collide or
+  /// change across app restarts.
+  String _stablePathHash(String input) {
+    var hash = 0xcbf29ce484222325;
+    for (final codeUnit in input.codeUnits) {
+      hash ^= codeUnit;
+      hash = (hash * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF;
+    }
+    return hash.toRadixString(16).padLeft(16, '0');
+  }
+
+  /// Renders Page 1 into persistent App Support storage with a solid white paper
+  /// background so Clear Cache keeps covers intact and text is always crisp.
   Future<String?> generateCoverThumbnail(BookModel book) async {
     if (book.thumbnailPath != null && await File(book.thumbnailPath!).exists()) {
       return book.thumbnailPath;
@@ -96,11 +108,11 @@ class PdfScannerService {
         await coversDir.create(recursive: true);
       }
 
-      final safeName = '${book.filePath.hashCode.abs()}.png';
+      final safeName = '${_stablePathHash(book.filePath)}.png';
       final outPath = p.join(coversDir.path, safeName);
       final outFile = File(outPath);
 
-      if (await outFile.exists()) {
+      if (await outFile.exists() && await outFile.length() > 0) {
         book.thumbnailPath = outPath;
         await _storageService.saveBookProgress(book, immediate: true);
         return outPath;
@@ -110,13 +122,14 @@ class PdfScannerService {
       try {
         if (doc.pages.isEmpty) return null;
         final page = doc.pages.first;
-        const targetWidth = 180.0;
+        const targetWidth = 220.0;
         final scale = targetWidth / page.width;
         final targetHeight = (page.height * scale).round();
 
         final pdfImage = await page.render(
           width: targetWidth.round(),
           height: targetHeight,
+          backgroundColor: 0xFFFFFFFF,
         );
         if (pdfImage == null) return null;
 
@@ -128,9 +141,11 @@ class PdfScannerService {
         uiImage.dispose();
 
         if (byteData != null) {
-          await outFile.writeAsBytes(byteData.buffer.asUint8List());
+          await outFile.writeAsBytes(byteData.buffer.asUint8List(), flush: true);
           book.thumbnailPath = outPath;
-          book.totalPages = doc.pages.length;
+          if (book.totalPages == 0) {
+            book.totalPages = doc.pages.length;
+          }
           await _storageService.saveBookProgress(book, immediate: true);
           return outPath;
         }

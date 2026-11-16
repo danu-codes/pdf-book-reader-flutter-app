@@ -599,4 +599,12 @@ class _ReaderScreenState extends State<ReaderScreen> {
       ),
     );
   }
+
+  void _recordPageVisit(int pageNumber) {
+    if (pageNumber < 1) return;
+    if (!widget.book.visitedPages.contains(pageNumber)) {
+      widget.book.visitedPages.add(pageNumber);
+    }
+  }
+
 }

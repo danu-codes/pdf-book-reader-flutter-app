@@ -19,7 +19,8 @@ class LibraryScreen extends StatefulWidget {
   State<LibraryScreen> createState() => _LibraryScreenState();
 }
 
-class _LibraryScreenState extends State<LibraryScreen> {
+class _LibraryScreenState extends State<LibraryScreen>
+    with WidgetsBindingObserver {
   final StorageService _storage = StorageService();
   final PdfScannerService _scanner = PdfScannerService();
 
@@ -34,14 +35,30 @@ class _LibraryScreenState extends State<LibraryScreen> {
   bool _defaultHorizontal = false;
   bool _keepScreenAwake = true;
   int _coverStorageBytes = 0;
-  int _archivedFinished = 0;
-  int _archivedPages = 0;
   bool _backupExists = false;
+  int _totalFinished = 0;
+  int _totalPagesRead = 0;
+  bool _hasPromptedRestoreThisSession = false;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _initFast();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Re-check backup file when returning from Android's "All files access" Settings screen
+    if (state == AppLifecycleState.resumed && !_hasPromptedRestoreThisSession) {
+      _reloadBooks().then((_) => _maybePromptRestore());
+    }
   }
 
   Future<void> _initFast() async {
@@ -51,14 +68,16 @@ class _LibraryScreenState extends State<LibraryScreen> {
       _storage.cleanupLegacyDuplicates();
     });
 
-    // If database is empty (fresh install or after Clear App Data) AND
-    // lumina_auto_backup.json exists in /Download/LuminaReaderBackup/,
-    // ask permission to restore immediately.
-    if (mounted &&
-        _books.isEmpty &&
-        _archivedFinished == 0 &&
-        _archivedPages == 0 &&
+    _maybePromptRestore();
+  }
+
+  void _maybePromptRestore() {
+    if (!mounted || _hasPromptedRestoreThisSession) return;
+    if (_books.isEmpty &&
+        _totalFinished == 0 &&
+        _totalPagesRead == 0 &&
         _backupExists) {
+      _hasPromptedRestoreThisSession = true;
       _promptRestoreFromFixedBackup();
     }
   }
@@ -71,14 +90,14 @@ class _LibraryScreenState extends State<LibraryScreen> {
   Future<void> _reloadBooks() async {
     final books = await _storage.getLibraryBooks();
     final coverBytes = await _storage.getCoverStorageBytes();
-    final archived = await _storage.getArchivedStats();
+    final combined = await _storage.getCombinedStats(books);
     final hasBackup = await _storage.hasExistingBackupFile();
     if (!mounted) return;
     setState(() {
       _books = books;
       _coverStorageBytes = coverBytes;
-      _archivedFinished = archived.archivedFinished;
-      _archivedPages = archived.archivedPages;
+      _totalFinished = combined.totalFinished;
+      _totalPagesRead = combined.totalPagesRead;
       _backupExists = hasBackup;
       _isLoading = false;
     });
@@ -213,6 +232,56 @@ class _LibraryScreenState extends State<LibraryScreen> {
     );
   }
 
+  Future<void> _confirmAndRemoveBook(BookModel book) async {
+    final visitedCount = book.visitedPages.length;
+    final total = book.totalPages;
+
+    // If already manually finished or user visited every page, remove & credit directly
+    if (book.isManuallyFinished || (total > 0 && visitedCount >= total)) {
+      await _storage.removeBookFromLibrary(
+        book.filePath,
+        userConfirmedFinished: true,
+      );
+      await _reloadBooks();
+      return;
+    }
+
+    final result = await showDialog<bool?>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.help_outline_rounded, size: 34),
+        title: const Text('Finished This Book?'),
+        content: Text(
+          'You visited $visitedCount${total > 0 ? ' of $total' : ''} pages in "${book.title}".\n\nDid you finish reading this book?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, null),
+            child: const Text('Cancel'),
+          ),
+          OutlinedButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text('No ($visitedCount pgs)'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text(
+              total > 0 ? 'Yes, Finished ($total pgs)' : 'Yes, Finished',
+            ),
+          ),
+        ],
+      ),
+    );
+
+    if (result == null) return; // User cancelled
+
+    await _storage.removeBookFromLibrary(
+      book.filePath,
+      userConfirmedFinished: result,
+    );
+    await _reloadBooks();
+  }
+
   void _showBookActions(BookModel book) {
     showModalBottomSheet(
       context: context,
@@ -279,8 +348,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
               subtitle: const Text('Keeps original PDF file & reading stats'),
               onTap: () async {
                 Navigator.pop(ctx);
-                await _storage.removeBookFromLibrary(book.filePath);
-                await _reloadBooks();
+                await _confirmAndRemoveBook(book);
               },
             ),
           ],
@@ -324,10 +392,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   Widget _buildSidebarDrawer(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    final finishedCount = _archivedFinished +
-        _books.where((b) => b.shelf == ReadingShelf.finished).length;
-    final totalPagesRead = _archivedPages +
-        _books.fold<int>(0, (sum, b) => sum + (b.lastPage > 1 ? b.lastPage : 0));
     final totalBookmarks = _books.fold<int>(
       0,
           (sum, b) => sum + b.bookmarks.length,
@@ -370,8 +434,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
                       _statColumn('${_books.length}', 'Books'),
-                      _statColumn('$finishedCount', 'Finished'),
-                      _statColumn('$totalPagesRead', 'Pages Read'),
+                      _statColumn('$_totalFinished', 'Finished'),
+                      _statColumn('$_totalPagesRead', 'Pages Read'),
                       _statColumn('$totalBookmarks', 'Bookmarks'),
                     ],
                   ),
@@ -490,15 +554,24 @@ class _LibraryScreenState extends State<LibraryScreen> {
             ),
             ListTile(
               leading: Icon(
-                _backupExists
-                    ? Icons.cloud_done_rounded
-                    : Icons.sync_rounded,
+                _backupExists ? Icons.cloud_done_rounded : Icons.sync_rounded,
                 color: cs.primary,
               ),
               title: const Text('Auto-Backup Location'),
               subtitle: const Text(
                 'Download/LuminaReaderBackup/lumina_auto_backup.json\n(Auto-saved on every change)',
               ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.restore_page_rounded),
+              title: const Text('Restore from Auto-Backup'),
+              subtitle: const Text(
+                'Recover stats & books from Download/LuminaReaderBackup',
+              ),
+              onTap: () async {
+                Navigator.pop(context);
+                await _restoreNowFromFixedFolder();
+              },
             ),
             ListTile(
               leading: Icon(
@@ -513,17 +586,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
               onTap: () async {
                 Navigator.pop(context);
                 await _confirmResetAllData();
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.restore_page_rounded),
-              title: const Text('Restore from Auto-Backup'),
-              subtitle: const Text(
-                'Recover stats & books from Download/LuminaReaderBackup',
-              ),
-              onTap: () async {
-                Navigator.pop(context);
-                await _restoreNowFromFixedFolder();
               },
             ),
             ListTile(
