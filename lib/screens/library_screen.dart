@@ -501,6 +501,21 @@ class _LibraryScreenState extends State<LibraryScreen> {
               ),
             ),
             ListTile(
+              leading: Icon(
+                Icons.delete_forever_rounded,
+                color: cs.error,
+              ),
+              title: Text(
+                'Reset All Data & Stats',
+                style: TextStyle(color: cs.error),
+              ),
+              subtitle: const Text('Clear library, pages read & finished count'),
+              onTap: () async {
+                Navigator.pop(context);
+                await _confirmResetAllData();
+              },
+            ),
+            ListTile(
               leading: const Icon(Icons.restore_page_rounded),
               title: const Text('Restore from Auto-Backup'),
               subtitle: const Text(
@@ -688,6 +703,67 @@ class _LibraryScreenState extends State<LibraryScreen> {
           ],
         ),
       ),
+    );
+  }
+
+  Future<void> _confirmResetAllData() async {
+    bool alsoDeleteBackup = false;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          icon: Icon(
+            Icons.warning_amber_rounded,
+            size: 36,
+            color: Theme.of(context).colorScheme.error,
+          ),
+          title: const Text('Reset All Data & Stats?'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'This will remove all books from your shelf, reset Finished Books and Pages Read to 0, and clear all bookmarks.',
+              ),
+              const SizedBox(height: 12),
+              CheckboxListTile(
+                contentPadding: EdgeInsets.zero,
+                value: alsoDeleteBackup,
+                onChanged: (v) =>
+                    setDialogState(() => alsoDeleteBackup = v ?? false),
+                title: const Text(
+                  'Also delete backup file in Downloads',
+                  style: TextStyle(fontSize: 13),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: Theme.of(context).colorScheme.error,
+                foregroundColor: Theme.of(context).colorScheme.onError,
+              ),
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Reset Everything'),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    if (confirmed != true) return;
+
+    await _storage.resetAllDataAndStats(deleteBackupFiles: alsoDeleteBackup);
+    await _reloadBooks();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('All library data and reading stats reset.')),
     );
   }
 }

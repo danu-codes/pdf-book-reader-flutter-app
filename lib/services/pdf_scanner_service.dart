@@ -11,8 +11,9 @@ class PdfScannerService {
   final StorageService _storageService = StorageService();
 
   /// Opens Android's native file manager directly.
-  /// If Android returns a temporary /cache/file_picker/ copy, moves it into
-  /// persistent App Support storage so "Clear Cache" never deletes the book.
+  /// Moves temporary /cache/file_picker/ copies into persistent shared storage
+  /// (/Download/LuminaReaderBackup/books) so Clear Cache, Clear Data, and
+  /// Reinstall never lose the PDF file.
   Future<List<BookModel>> pickPdfsFromFileManager() async {
     final pickedFiles = await FilePicker.pickFiles(
       type: FileType.custom,
@@ -35,18 +36,28 @@ class PdfScannerService {
 
       String finalPath = rawPath;
 
-      // Protect against Android's "Clear Cache" wiping /cache/file_picker/ files
       if (rawPath.contains('/cache/')) {
-        final persistentDir = Directory(p.join(supportDir.path, 'library_pdfs'));
-        if (!await persistentDir.exists()) {
-          await persistentDir.create(recursive: true);
+        Directory persistentDir;
+        try {
+          persistentDir = Directory(
+            p.join(StorageService.fixedBackupDirPath, 'books'),
+          );
+          if (!await persistentDir.exists()) {
+            await persistentDir.create(recursive: true);
+          }
+        } catch (_) {
+          persistentDir = Directory(p.join(supportDir.path, 'library_pdfs'));
+          if (!await persistentDir.exists()) {
+            await persistentDir.create(recursive: true);
+          }
         }
+
         final destPath = p.join(persistentDir.path, p.basename(rawPath));
         final destFile = File(destPath);
         if (!await destFile.exists()) {
           await sourceFile.copy(destPath);
         }
-        await sourceFile.delete(); // Remove temp cache copy immediately
+        await sourceFile.delete();
         finalPath = destPath;
       }
 
